@@ -18,7 +18,8 @@ from support import GitFixture, git
 from adw_modules import agent_pi, agents, gates, git_helper, permissions, session
 from adw_modules.data_types import (AgentCall, AgentConfig, BuildOutput, ConfigDefaults,
                                     ObservabilityConfig, PhaseParams, PiResult,
-                                    PromptEngineering, RunTargets, SSSFConfig)
+                                    PromptEngineering, RunTargets, SSSFConfig,
+                                    UsageBreakdown)
 
 
 class ScriptedAgent:
@@ -167,6 +168,36 @@ class UnauthorizedMutationTest(HarnessFixture):
         with self.assertRaises(RuntimeError):
             self.build(run, [])
         self.assertEqual(fake.calls, agents.JSON_FIX_ATTEMPTS + 1)
+
+    def test_the_agent_map_counts_every_send_not_every_phase(self):
+        """A retried phase is one phase and two model calls. The map says two.
+
+        This is the number the whole efficiency question rests on: a phase count
+        cannot distinguish a clean run from one that paid twice to get the same
+        answer, and token totals do not say how many calls produced them.
+        """
+        replies = ["not JSON at all",
+                   json.dumps({"status": "success", "summary": "built",
+                               "changed_files": []})]
+        sent = []
+
+        def scripted_pi(request, on_event=None, on_spawn=None, on_exit=None):
+            sent.append(request.prompt)
+            return PiResult(text=replies[min(len(sent), len(replies)) - 1],
+                            session_id="scripted",
+                            usage=UsageBreakdown(total_tokens=10, total_cost=0.5))
+
+        real = agent_pi.run
+        agent_pi.run = scripted_pi
+        self.addCleanup(setattr, agent_pi, "run", real)
+        run = self.new_run()
+
+        self.build(run, [])
+
+        self.assertEqual(len(sent), 2)                   # the retry really happened
+        entry = json.loads((run.session_dir / "agent_map.json").read_text())["builder"]
+        self.assertEqual(entry["sends"], 2)
+        self.assertEqual(entry["usage"]["total_tokens"], 20)   # both sends, not the last
 
     def test_a_gate_failure_still_rolls_back_an_unauthorized_write(self):
         self.write("protected.txt", "operator bytes\n")

@@ -106,11 +106,17 @@ def execute(run, phase: Phase, call: AgentCall) -> EnvelopeBase:
     # Parse retries and gate corrections re-enter the SAME pi session, so the
     # last send is the one whose context occupancy is current — while spend is
     # the opposite: every send costs, so usage accumulates across all of them.
+    # `sends` is that same sum expressed as a count: one phase is one agent, but
+    # it is not necessarily one model call, and the difference is invisible in
+    # token totals alone. It is what lets a workflow be asked how many calls it
+    # takes before anyone tries to make it take fewer.
     latest: agent_pi.PiResult | None = None
     spent = UsageBreakdown()
+    sends = 0
 
     def send(prompt_text: str) -> agent_pi.PiResult:
-        nonlocal latest
+        nonlocal latest, sends
+        sends += 1
         request = PiRequest(
             prompt=prompt_text,
             system_prompt=system_text,
@@ -217,8 +223,20 @@ def execute(run, phase: Phase, call: AgentCall) -> EnvelopeBase:
     run.tracer.agent_session_row(run.adw_id, agent, session_id,
                                  context_tokens=context.context_tokens,
                                  context_window=context.context_window)
+    # Sends and spend carry forward on the map, because an agent that runs in
+    # more than one phase rejoins the same session and keeps spending in it —
+    # the per-phase numbers stay in the agent_end event below. A model change
+    # starts a new session (see _agent_session_id) and so starts a new meter:
+    # totals that mixed two models would answer no question worth asking.
+    prior = run.agent_map.get(agent.name) or {}
+    if prior.get("model") != agent.model:
+        prior = {}
+    lifetime = UsageBreakdown(**(prior.get("usage") or {}))
+    lifetime.merge(spent)
     run.save_agent_map(agent.name, {"session_id": session_id, "model": agent.model,
-                                    "coding_agent": agent.coding_agent})
+                                    "coding_agent": agent.coding_agent,
+                                    "sends": prior.get("sends", 0) + sends,
+                                    "usage": lifetime.model_dump()})
     run.tracer.event(EventRecord(adw_id=run.adw_id, phase_id=phase.phase_id,
                                  type="handoff", name=agent.name,
                                  payload={"artifacts": envelope.artifacts,
