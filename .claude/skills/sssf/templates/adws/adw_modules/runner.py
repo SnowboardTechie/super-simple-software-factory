@@ -13,9 +13,10 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 
-from . import agents, git_helper
+from . import agents
 from .console import Console
-from .data_types import AgentCall, EnvelopeBase, EventRecord, Phase, PhaseParams
+from .data_types import (AgentCall, EnvelopeBase, EventRecord, Phase, PhaseParams,
+                         RunTargets)
 from .utils import ensure_dir, now_iso
 
 
@@ -40,7 +41,8 @@ class PhaseHandle:
 
 
 class Run:
-    def __init__(self, cfg, adw_id: str, tracer, engineer: str):
+    def __init__(self, cfg, adw_id: str, tracer, engineer: str,
+                 targets: RunTargets | None = None):
         self.cfg = cfg
         self.adw_id = adw_id
         self.tracer = tracer
@@ -50,12 +52,42 @@ class Run:
         self.tokens = 0
         self.cost = 0.0
         self._seq = tracer.max_phase_seq(adw_id)   # a joined run continues the sequence
-        self.repo_root = git_helper.repo_root()    # where every agent is spawned to work
-        self.session_dir = ensure_dir(Path(cfg.defaults.data_dir) / "sessions" / adw_id)
+        # The four roots this run keeps apart. Omitted, they collapse to the
+        # repository the process was launched in — v1's single root exactly.
+        self.targets = targets or RunTargets.resolve(cfg)
+        self.trace_db = self.targets.trace_db(cfg)   # resolved once, inside state_root
+        self.session_dir = ensure_dir(self.targets.state_root / "sessions" / adw_id)
         self.context_handoff_dir = ensure_dir(self.session_dir / "context_handoff")
         self._agent_map_path = self.session_dir / "agent_map.json"
         self.agent_map: dict = (json.loads(self._agent_map_path.read_text())
                                 if self._agent_map_path.exists() else {})
+        # The tree as it looked before the CURRENT agent phase started. Gates
+        # ask permissions what this phase changed; without a baseline they
+        # would be shown the engineer's pre-existing dirty files too.
+        self.tree_baseline: dict[str, str] | None = None
+        self._accepted: list[str] = []
+
+    @property
+    def repo_root(self) -> Path:
+        """Where every agent is spawned to work — the target checkout."""
+        return self.targets.target_worktree
+
+    # ── accepted change set (what a commit phase is allowed to stage) ───────
+    def record_changes(self, paths: list[str]) -> None:
+        """Remember paths permissions.enforce watched an agent change and allowed."""
+        for path in paths:
+            if path not in self._accepted:
+                self._accepted.append(path)
+
+    def take_changes(self) -> list[str]:
+        """Hand the accumulated change set to a commit phase, and start over.
+
+        Drained rather than read, so a chain that commits more than once
+        (adw_simple_sdlc commits three times) commits each agent's own work and
+        never re-offers paths the previous commit already landed.
+        """
+        accepted, self._accepted = self._accepted, []
+        return accepted
 
     # ── agent map (adw_id -> per-agent coding-agent session ids) ────────────
     def save_agent_map(self, agent: str, entry: dict) -> None:
@@ -99,7 +131,7 @@ class Run:
             self.tracer.session_finish(self.adw_id, ok=False)
             self.console.phase_ended(phase, time.monotonic() - clock)
             self.console.session_finished(False, self.tokens, self.cost,
-                                          self.cfg.observability.db)
+                                          self.trace_db)
             raise
         else:
             phase.status = "success"
@@ -138,5 +170,5 @@ class Run:
                 type="error", name="not_accepted", payload={"reason": note}))
             self.console.note(f"not accepted: {note}")
         self.tracer.session_finish(self.adw_id, ok=ok)
-        self.console.session_finished(ok, self.tokens, self.cost, self.cfg.observability.db)
+        self.console.session_finished(ok, self.tokens, self.cost, self.trace_db)
         return 0 if ok else 1

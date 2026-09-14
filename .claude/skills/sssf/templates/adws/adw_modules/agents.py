@@ -140,51 +140,73 @@ def execute(run, phase: Phase, call: AgentCall) -> EnvelopeBase:
     # send in this phase — first prompt, JSON retries, gate corrections — is
     # measured against this one baseline.
     tree_before = permissions.snapshot(run)
+    # Published on the run so a gate can ask "what did THIS phase change" and
+    # be told the truth, instead of being handed the whole dirty tree.
+    run.tree_baseline = tree_before
 
-    result = send(user_text)
-    envelope, attempt = _parse_with_retries(run, phase, call, result, send)
-
-    # claim gates — violations flow back into the SAME session as corrections
-    for gate_attempt in range(1, max(1, phase.params.retries + 1) + 1):
-        violations = []
-        for gate in call.gates:
-            report = _as_report(gate(envelope, run))
-            found = report.violations
-            run.tracer.gate_row(phase, gate.__name__, report, gate_attempt)
+    def enforce_permissions() -> list[str]:
+        try:
+            return permissions.enforce(run, phase, agent, tree_before)
+        except permissions.PermissionBreach as breach:
             run.tracer.event(EventRecord(
                 adw_id=run.adw_id, phase_id=phase.phase_id,
-                type="gate_fail" if found else "gate_pass", name=gate.__name__,
-                payload={"attempt": gate_attempt, "violations": found,
-                         "checks": [c.model_dump() for c in report.checks]}))
-            run.console.gate_result(gate.__name__, report)
-            violations.extend(found)
-        if not violations:
-            break
-        if gate_attempt > phase.params.retries:
-            raise GateFailure(f"{agent.name} failed gates after {gate_attempt} attempt(s):\n- "
-                              + "\n- ".join(violations))
-        phase.attempt = gate_attempt
-        run.console.retry(agent.name, gate_attempt, phase.params.retries,
-                          f"{len(violations)} gate violation(s)")
-        correction = ("Your previous response failed validation:\n- "
-                      + "\n- ".join(violations)
-                      + "\n\nFix these problems, then re-emit ONLY your Report JSON.")
-        result = send(correction)
+                type="error", name="permission_breach",
+                payload={"agent": agent.name, "error": str(breach),
+                         "writes": agent.writes,
+                         "protected_files": run.cfg.defaults.protected_files}))
+            raise
+
+    # Every path after the first send can fail: the agent call itself, typed
+    # parsing, or a deterministic gate. Permission enforcement belongs on all
+    # of those exits, not only the success path. A breach deliberately replaces
+    # the earlier error because restoring an unauthorized mutation is the
+    # security boundary that must be reported.
+    try:
+        result = send(user_text)
         envelope, attempt = _parse_with_retries(run, phase, call, result, send)
+
+        # claim gates — violations flow back into the SAME session as corrections
+        for gate_attempt in range(1, max(1, phase.params.retries + 1) + 1):
+            violations = []
+            for gate in call.gates:
+                report = _as_report(gate(envelope, run))
+                found = report.violations
+                run.tracer.gate_row(phase, gate.__name__, report, gate_attempt)
+                run.tracer.event(EventRecord(
+                    adw_id=run.adw_id, phase_id=phase.phase_id,
+                    type="gate_fail" if found else "gate_pass", name=gate.__name__,
+                    payload={"attempt": gate_attempt, "violations": found,
+                             "checks": [c.model_dump() for c in report.checks]}))
+                run.console.gate_result(gate.__name__, report)
+                violations.extend(found)
+            if not violations:
+                break
+            if gate_attempt > phase.params.retries:
+                raise GateFailure(
+                    f"{agent.name} failed gates after {gate_attempt} attempt(s):\n- "
+                    + "\n- ".join(violations))
+            phase.attempt = gate_attempt
+            run.console.retry(agent.name, gate_attempt, phase.params.retries,
+                              f"{len(violations)} gate violation(s)")
+            correction = ("Your previous response failed validation:\n- "
+                          + "\n- ".join(violations)
+                          + "\n\nFix these problems, then re-emit ONLY your Report JSON.")
+            result = send(correction)
+            envelope, attempt = _parse_with_retries(run, phase, call, result, send)
+    except BaseException:
+        enforce_permissions()
+        raise
 
     # Permission is checked after every send is done, and before the envelope is
     # accepted: an agent does not get to report success on a phase in which it
     # wrote somewhere it was not allowed to.
-    try:
-        touched = permissions.enforce(run, phase, agent, tree_before)
-    except permissions.PermissionBreach as breach:
-        run.tracer.event(EventRecord(adw_id=run.adw_id, phase_id=phase.phase_id,
-                                     type="error", name="permission_breach",
-                                     payload={"agent": agent.name, "error": str(breach),
-                                              "writes": agent.writes,
-                                              "protected_files": run.cfg.defaults.protected_files}))
-        raise
+    touched = enforce_permissions()
     if touched:
+        # The accepted change set: what a commit phase later stages, by path.
+        # An agent's claim never reaches git — only what permissions watched it
+        # do and allowed.
+        run.record_changes([p for p in touched
+                            if p in set(permissions.repo_changes(run))])
         run.tracer.event(EventRecord(adw_id=run.adw_id, phase_id=phase.phase_id,
                                      type="log", name="paths_touched",
                                      payload={"agent": agent.name, "paths": touched}))
@@ -264,7 +286,8 @@ def _extract_json(text: str) -> dict:
     return json.loads(candidate[start:end + 1])
 
 
-def _parse_with_retries(run, phase: Phase, call: AgentCall, result, send):
+def _parse_with_retries(run, phase: Phase, call: AgentCall, result,
+                        send) -> tuple[EnvelopeBase, int]:
     """Parse the final response against the declared output type; on failure,
     continue the SAME session with a correction (bounded)."""
     for attempt in range(1, JSON_FIX_ATTEMPTS + 2):
@@ -285,6 +308,7 @@ def _parse_with_retries(run, phase: Phase, call: AgentCall, result, send):
                 f"Your response was not valid JSON for the required structure "
                 f"({error}). Respond again with ONLY a JSON object with these "
                 f"fields: {fields}. No prose, no code fences.")
+    raise AssertionError("bounded parse loop exited without a result")
 
 
 def _persist_envelope(run, phase: Phase, agent_name: str, call: AgentCall,

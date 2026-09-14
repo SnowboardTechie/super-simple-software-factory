@@ -12,7 +12,7 @@ Answer four questions, in order:
 |---|---|---|---|
 | `scout` | you need to FIND something first — read-only recon | `ScoutOutput` | `artifacts_exist` |
 | `planner` | the work needs a plan before code changes | `PlanOutput` | `artifacts_exist`, `files_non_empty` |
-| `builder` | code must change | `BuildOutput` | `diff_matches_claims` |
+| `builder` | code must change | `BuildOutput` | `changed_files_match` |
 | `reviewer` | the change must be confirmed to BE what was asked for | `ReviewOutput` | `artifacts_exist`, `verdict_consistent` |
 | *(no tester)* | verifying that it RUNS is a `kind="code"` phase over `quality.py`, not an agent | `QualityResult` → `as_envelope` | the exit code is the check |
 | `documenter` | finished work needs a write-up (runs after a build, off the diff) | `DocumentOutput` | `artifacts_exist`, `files_non_empty` |
@@ -28,7 +28,7 @@ Answer four questions, in order:
 
 3. **Does anything loop?** Test-fix cycles are bounded fix loops (see `update_adw.md`), not phase retries.
 
-4. **What does each call need to prove?** Pick gates per call from `gates.py`: `artifacts_exist`, `files_non_empty`, `json_parses`, `diff_matches_claims`, `tests_pass("cmd")` — or an inline one-off.
+4. **What does each call need to prove?** Pick gates per call from `gates.py`: `artifacts_exist`, `files_non_empty`, `json_parses`, `changed_files_match`, `tests_pass("cmd")` — or an inline one-off.
 
 ## Step 2 — Ownership rules (the swim lanes depend on these)
 
@@ -84,12 +84,13 @@ def main(prompt: str, config: str = "adws/adw_sssf_config/sssf.config.yaml", adw
     with run.phase(PhaseParams(name="build", kind="agent", owner="builder", retries=1,
                                description="Implement the plan exactly")) as ph:
         build = ph.call(AgentCall(output_type=BuildOutput, prompt=prompt, previous=plan,
-                                  gates=[gates.diff_matches_claims]))
+                                  gates=[gates.changed_files_match]))
 
     with run.phase(PhaseParams(name="commit", kind="code", owner="git",
                                description="Commit the working tree")) as ph:
         message = build.commit_message or f"sssf({run.adw_id}): {build.summary}"
-        ph.log(sha=git_helper.commit_all(message), message=message)
+        ph.log(sha=git_helper.commit_paths(message, run.take_changes(),
+                                           cwd=run.repo_root), message=message)
 
     return run.finish()
 
@@ -111,7 +112,9 @@ if __name__ == "__main__":
 - **The engineer request phase comes first**, always.
 - **Four-param rule** — `run.phase()` and `ph.call()` each take exactly one object; new helpers with >4 params get a data type.
 - **Stay thin** — sequencing and acceptance only; real logic goes in `adw_modules/` (`update_modules.md`).
-- **Committing is a code phase, and it needs a fallback.** `PlanOutput`, `BuildOutput`, and `DocumentOutput` each carry a `commit_message` the agent writes **for its own work product** — the spec, the code, the write-up. It defaults to empty, so always `envelope.commit_message or <fallback>`, and commit each product with the message of the agent that made it (`adw_simple_sdlc.py` commits three times and never crosses them). `git_helper.commit_all(message)` stages everything, commits, and returns the short sha; it raises a clear error when the cwd isn't a git repo or nothing changed, and that raise fails the phase.
+- **Committing is a code phase, and it needs a fallback.** `PlanOutput`, `BuildOutput`, and `DocumentOutput` each carry a `commit_message` the agent writes **for its own work product** — the spec, the code, the write-up. It defaults to empty, so always `envelope.commit_message or <fallback>`, and commit each product with the message of the agent that made it (`adw_simple_sdlc.py` commits three times and never crosses them).
+
+  `git_helper.commit_paths(message, run.take_changes(), cwd=run.repo_root)` stages **exactly** the accepted change set — the paths `permissions.enforce` watched the agents change and allowed — commits them, and returns the short sha. `run.take_changes()` drains, so a chain that commits three times never re-offers the first commit's paths. It raises, failing the phase, when the target isn't a git repo, when nothing was accepted, or when a path it was handed shows no change. The agent's `changed_files` claim is gated but never reaches git.
 
 ## Before you ship it
 

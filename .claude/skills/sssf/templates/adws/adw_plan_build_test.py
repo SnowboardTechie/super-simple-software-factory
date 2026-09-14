@@ -46,7 +46,8 @@ def main(prompt: str, config: str = "adws/adw_sssf_config/sssf.config.yaml", adw
     with run.phase(PhaseParams(name="build", kind="agent", owner="builder",
                                description="Implement the plan exactly")) as ph:
         previous = ph.call(AgentCall(output_type=BuildOutput, prompt=prompt, previous=plan,
-                                     gates=[gates.artifacts_exist]))
+                                     gates=[gates.changed_files_match,
+                                            gates.artifacts_exist]))
 
     test = None
     for i in range(1, MAX_FIX_LOOPS + 1):
@@ -64,14 +65,17 @@ def main(prompt: str, config: str = "adws/adw_sssf_config/sssf.config.yaml", adw
                                                "verbatim output")) as ph:
             previous = ph.call(AgentCall(output_type=BuildOutput, prompt=prompt,
                                          previous=quality.as_envelope(test, "tests"),
-                                         gates=[gates.artifacts_exist]))
+                                         gates=[gates.changed_files_match,
+                                                gates.artifacts_exist]))
 
     # Only tested work gets committed — a red suite leaves the tree uncommitted.
     if test is not None and test.passed:
         with run.phase(PhaseParams(name="commit", kind="code", owner="git",
                                    description="Land the code only after the suite came back green")) as ph:
             message = previous.commit_message or f"sssf({run.adw_id}): {previous.summary}"
-            ph.log(sha=git_helper.commit_all(message), message=message)
+            ph.log(sha=git_helper.commit_paths(message, run.take_changes(),
+                                               cwd=run.repo_root),
+                   message=message)
 
     return run.finish(accepted=test is not None and test.passed,
                       reason=f"the suite still failed after {MAX_FIX_LOOPS} fix attempt(s)")

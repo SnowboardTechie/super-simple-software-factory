@@ -22,6 +22,59 @@ Everyone can get an agent to write code once. Almost nobody gets the same result
 
 ---
 
+## This is a fork
+
+Forked from **[disler/super-simple-software-factory](https://github.com/disler/super-simple-software-factory)** at `de31374`, MIT, attribution and `LICENSE` unchanged. Upstream is tracked normally; this fork is never rebased or force-pushed.
+
+The changes here are all one argument: **an agent's blast radius should be a thing the harness can state, and then check.** Upstream verifies an agent's claims after the fact, which is the right design — these changes make the verification actually load-bearing, because a check that can be passed by accident is not a check.
+
+```
+uv run tests/run_tests.py          # the whole suite, no global install
+uv run tests/run_tests.py gates    # one file
+```
+
+`fork.json` is the same list in machine-readable form, for anything downstream that pins an exact engine commit.
+
+### Divergence from upstream
+
+Four of these change a generic interface. They are **not drop-in compatible**, and an ADW carried over from upstream needs the migration in the right-hand column.
+
+| What changed | Why | Migration |
+|---|---|---|
+| **`commit_all()` is gone.** `commit_paths(message, paths, cwd=...)` stages an explicit path set | `git add -A` swept the engineer's unrelated uncommitted work into the agent's commit, under the agent's message | `ph.log(sha=git_helper.commit_paths(message, run.take_changes(), cwd=run.repo_root))`. There is deliberately no shim: a silent `git add -A` behind a new name would be the same bug with a better name |
+| **`diff_matches_claims` → `changed_files_match`** | The old gate asked only whether each claimed path exists, so claiming `README.md` passed anywhere, and a file the agent rewrote but never mentioned was invisible | Swap the name at the call site. Expect it to be stricter: an omission fails now, not just an invention |
+| **Artifacts resolve under explicit roots**, and an empty `artifacts` list fails `artifacts_exist` | `Path(a)` reached anywhere the process could; a gate that examined nothing reported green | Declare artifacts inside `context_handoff_dir` or the target repo. An agent that writes no file now fails the gate that says it must |
+| **`run.repo_root` is derived, not assigned** — a run carries `control_root`, `state_root`, `target_repo`, `target_worktree` (`RunTargets`) | One root meant the factory's home, the runtime's home, and the codebase under work were the same directory by construction | Nothing, for an ADW that works on the repo it was launched in — the defaults collapse to exactly that. Pass `session.ensure(cfg, adw_id, targets=...)` to point a run elsewhere |
+| **`observability.db` is resolved against `state_root`**, not the process directory, and an absolute path outside `state_root` is refused | The visualizer derives `sessions/` from the db's own directory, so a db that is not beside its sessions points the UI at nothing | Nothing for the shipped default — `adws/adw_data/sssf.db` under the default state root resolves to exactly the same file as v1. An explicit absolute db must be inside `state_root` |
+
+And three that are additive — existing callers are unaffected:
+
+| What changed | Why |
+|---|---|
+| `permissions.snapshot()` fingerprints by **type + git object id**, watches gitignored files and tracked paths hidden by index flags, and covers **every watched root** | Numstat counts cannot tell two different `+3/−3` rewrites apart, content alone cannot see a `chmod +x`, and assume-unchanged/skip-worktree can make porcelain omit a modified file entirely |
+| Agent phases snapshot and restore **HEAD, refs, and the exact index bytes**, and enforce permissions on success, parse/gate failure, or agent-process failure | A clean self-commit is invisible to worktree status; index flags can hide worktree changes; and the old success-only check left unauthorized bytes behind whenever parsing or a gate raised |
+| `control_root` and `target_repo` are **denied mutation roots** whenever they differ from `target_worktree` | `protected_files` was matched against the one tree `snapshot()` looked at, so separating the roots aimed the factory's own guard at the wrong directory |
+| A named `target_worktree` must be `target_repo` itself or one of its **linked worktrees**, and a named `target_repo` must be a **checkout root** | Any directory that happened to be a git repo was accepted, so the identity a whole run is about could be decided by a typo. A defaulted root still normalises to its checkout root, so launching from `src/` works as it always did |
+| Build-noise (`__pycache__`, `*.pyc`) is exempt in the target worktree only | In the factory or the trunk a `.pyc` is executable Python in a tree no agent may write to |
+| Every `git_helper` function takes an explicit `cwd`, defaulting to the process directory | A run can now be about a repository it was not launched from |
+| `redact.py`, applied at **every** tracer sink | `events.name`/`payload_json`, `envelopes.payload_json`, `gate_results.checks_json`/`violations_json`, `processes.command`, `phases.description`/`error`, `sessions.request` and `agent_sessions.model` all took free text straight from an agent, a tool call, or an exception message, and the visualizer reads all of them |
+
+### What this still is not
+
+**Not a sandbox.** Every one of these checks runs *after* the agent's turn, against the repository. `bash` can still do anything the operator can — reach the network, write outside the repo, touch another checkout entirely. What the harness guarantees is that a change *inside the target worktree* is detected, named, and undone where it can be, and that the phase fails either way. A workflow that needs a stronger guarantee than that should be read-only.
+
+Four limits worth naming rather than discovering:
+
+- git does not walk into a **wholly-ignored directory** — it reports `node_modules/` as one entry — so a change to a file inside one is not fingerprinted. The directory appearing or disappearing is.
+- **Only roots are watched.** `control_root`, `target_repo` and `target_worktree` are fingerprinted; a write to any *other* directory on the machine is not seen at all. Roots that are not git repositories are skipped entirely — there is nothing to diff against. Roots are compared by canonical checkout, so a factory and a trunk that are the same checkout are watched once, under `control`.
+- **Runtime exemption is path-exact.** Only the resolved `state_root` is omitted from snapshots. A same-named `adws/adw_data/` directory in a separate target repository receives no special permission.
+- **Git state is restored locally, not remotely.** Agent phases may not change HEAD, refs, or the index; those surfaces and safely recoverable worktree bytes are rolled back before the phase fails. Dangling objects and reflog entries may remain for recovery; a command that already pushed, rewrote an external repository, or changed server state cannot be recalled.
+- **The state root may not contain a watched root.** Everything under it counts as the run's own runtime, so a state root wrapped *around* a watched root would hide every change in it. Inside a watched root (the default) or disjoint from all of them is supported; `RunTargets.resolve` refuses the rest.
+- **Redaction is pattern-based.** A secret with no recognisable name and no recognisable shape passes through. Files under the session runtime (`raw_output.jsonl`, `envelope.json`, rendered prompts) are deliberately raw — they are the evidence the trace *refers to*. Trace a reference to one, rather than copying a private payload into the db.
+- **Detection is not prevention.** Everything here runs after the agent's turn. What can be undone is undone and the phase fails either way, but a `bash` call that already sent data somewhere cannot be recalled.
+
+---
+
 ## Why this exists
 
 <p align="center">
@@ -203,9 +256,10 @@ with run.phase(PhaseParams(name="plan", kind="agent", owner="planner",
                              gates=[gates.artifacts_exist, gates.files_non_empty]))
 
 with run.phase(PhaseParams(name="commit", kind="code", owner="git",
-                           description="Commit the working tree")) as ph:
+                           description="Land the builder's changes")) as ph:
     message = build.commit_message or f"sssf({run.adw_id}): {build.summary}"
-    ph.log(sha=git_helper.commit_all(message), message=message)
+    ph.log(sha=git_helper.commit_paths(message, run.take_changes(),
+                                       cwd=run.repo_root), message=message)
 
 return run.finish(accepted=review.approved, reason="the reviewer never approved")
 ```
@@ -213,6 +267,8 @@ return run.finish(accepted=review.approved, reason="the reviewer never approved"
 Three kinds, three swim lanes. **engineer** is the human lane. **agent** is `ph.call(...)`: prompt in, typed envelope out, gates verified. **code** is a deterministic step that stands on its own, like a commit or a migration, and it is never buried inside an agent phase, so the trace shows exactly when code ran and when an agent was working.
 
 That commit phase is the whole pattern in miniature. The builder proposes the message as a field on its envelope. Code decides whether to use it, falls back when it is empty, and performs the write. The agent never runs `git commit` itself.
+
+It also decides *which paths*. `run.take_changes()` is the accepted change set — the paths `permissions.enforce` watched the agents actually change and allowed — and `commit_paths` stages exactly those and refuses anything else. The agent's `changed_files` claim is gated, but it never reaches git.
 
 **Success must be earned.** Every phase defaults to `fail`. A clean exit flips it, and an agent phase also needs its envelope to parse and every gate to come back green. `run.finish(accepted=...)` adds the second question, because phases passing is not the same as the run being acceptable: a test phase that ran a red suite did its job perfectly. One call settles the exit code, the session status, and the banner together, so they cannot disagree.
 
@@ -240,7 +296,7 @@ class BuildOutput(EnvelopeBase):
 
 Determinism is wired into every step. Agents must return a specific structure, every time. If it does not parse, they get asked again until it does.
 
-Gates verify claims, never predictions. Nobody knows which files an agent will touch before it finishes, so gates run **after** the fact against the envelope's own declarations: `artifacts_exist`, `files_non_empty`, `json_parses`, `diff_matches_claims`, `tests_pass(...)`. A gate is a callable with the signature `gate(envelope, run) -> GateReport`, one `check(item, ok, note)` per thing it examined, so a green gate tells you *what* it verified.
+Gates verify claims, never predictions. Nobody knows which files an agent will touch before it finishes, so gates run **after** the fact against the envelope's own declarations: `artifacts_exist`, `files_non_empty`, `json_parses`, `changed_files_match`, `tests_pass(...)`. A gate is a callable with the signature `gate(envelope, run) -> GateReport`, one `check(item, ok, note)` per thing it examined, so a green gate tells you *what* it verified.
 
 When JSON does not parse or a gate returns violations, **nothing restarts**. The harness re-prompts the same session with a correction naming exactly what was wrong, and the context window stays intact. Pi treats `--session-id` as create-or-continue, so running an agent and continuing it are the same call. A cold restart throws away everything the agent learned. A correction costs one message.
 
@@ -360,7 +416,10 @@ Honest edges, because knowing them is cheaper than discovering them.
 | The synced triad drifts | Type, `## Report` example, and `output_type=` disagree, so every call burns correction rounds | Grep the type name and fix all three in one edit |
 | Gates pass, output is bad | Gates check what a predicate can check, not plan quality or code taste | Run the `reviewer`, or read it yourself |
 | An agent edits something it should not | Detected and rolled back after the call, and the phase fails | Expected. Widen that agent's `writes` if the change was legitimate |
-| Commit phase has nothing to commit | `commit_all` raises if the cwd is not a git repo or nothing changed | `git init` with one commit first. A no-op build fails the phase rather than committing nothing |
+| An agent stages or commits during its phase | HEAD, refs, or index drift is detected; local Git state and safely recoverable bytes are restored, and the phase fails | Keep Git mutation in an explicit code phase. Agent phases only edit permitted worktree paths |
+| Commit phase has nothing to commit | `commit_paths` raises when the target is not a git repo, when the accepted change set is empty, or when a path it was handed is not actually dirty | `git init` with one commit first. A no-op build fails the phase rather than committing nothing |
+| A changed-file gate fails on a file the agent did not mention | `changed_files_match` compares the claim against the phase's real diff in **both** directions | Expected. The envelope must name every path the agent changed, and no path it did not |
+| A declared artifact is refused | Artifacts resolve under the run's state root or target worktree; traversal, absolute paths elsewhere, and symlink escapes are rejected | Write reports into `context_handoff_dir` or the repo, and declare them by the path you wrote |
 | `install.py --force` | Overwrites **all** stamped files, config and prompts included | Commit before you force |
 | `coding_agent: claude_code` | Schema-valid, but `agent_cc.py` raises | v1 is Pi only |
 

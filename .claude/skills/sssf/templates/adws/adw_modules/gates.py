@@ -6,6 +6,11 @@ session as a correction. Every check is recorded either way, so a green gate
 says WHAT it verified instead of only that it passed.
 
 Gates check what is mechanically checkable; plan quality is a reviewer's job.
+
+A declared path is resolved through `run.targets` before it is looked at, so a
+gate can only ever be pointed at the run's own runtime or the codebase it was
+given. `../../etc/hosts`, an absolute path elsewhere, and a symlink out of the
+tree are all refused by the same resolution rather than by three special cases.
 """
 
 from __future__ import annotations
@@ -14,6 +19,7 @@ import json
 import subprocess
 from pathlib import Path
 
+from . import permissions
 from .data_types import EnvelopeBase, GateReport
 
 TAIL_CHARS = 1000        # command output kept as evidence on a failure
@@ -24,21 +30,41 @@ def _size(path: Path) -> str:
     return f"{n}B" if n < 1024 else f"{n / 1024:.1f}KB"
 
 
+def _resolved(declared: str, run) -> Path | None:
+    """The artifact's real path, or None when it escapes the run's roots."""
+    try:
+        return run.targets.resolve_artifact(declared)
+    except ValueError:
+        return None
+
+
 def artifacts_exist(envelope: EnvelopeBase, run) -> GateReport:
+    """Every declared artifact is inside the run's roots and really there.
+
+    An empty declaration fails. A gate that examined nothing is not evidence of
+    anything, and "I produced no artifact" is the shape of every agent that
+    answered in prose and wrote no file — precisely what this gate is for.
+    """
     report = GateReport()
+    if not envelope.artifacts:
+        return report.check("artifacts", False,
+                            "no artifact was declared — this phase must produce at least one")
     for a in envelope.artifacts:
-        p = Path(a)
-        report.check(a, p.exists(),
-                     f"exists, {_size(p)}" if p.exists() else "declared artifact does not exist")
+        p = _resolved(a, run)
+        if p is None:
+            report.check(a, False, "declared artifact resolves outside this run's roots")
+        else:
+            report.check(a, p.exists(),
+                         f"exists, {_size(p)}" if p.exists() else "declared artifact does not exist")
     return report
 
 
 def files_non_empty(envelope: EnvelopeBase, run) -> GateReport:
     report = GateReport()
     for a in envelope.artifacts:
-        p = Path(a)
-        if not (p.exists() and p.is_file()):
-            continue                       # existence is artifacts_exist's job
+        p = _resolved(a, run)
+        if p is None or not (p.exists() and p.is_file()):
+            continue                       # existence/containment is artifacts_exist's job
         empty = p.stat().st_size == 0
         report.check(a, not empty, "declared artifact is empty" if empty else _size(p))
     return report
@@ -47,8 +73,8 @@ def files_non_empty(envelope: EnvelopeBase, run) -> GateReport:
 def json_parses(envelope: EnvelopeBase, run) -> GateReport:
     report = GateReport()
     for a in envelope.artifacts:
-        p = Path(a)
-        if p.suffix != ".json" or not p.exists():
+        p = _resolved(a, run)
+        if p is None or p.suffix != ".json" or not p.exists():
             continue
         try:
             parsed = json.loads(p.read_text())
@@ -58,13 +84,38 @@ def json_parses(envelope: EnvelopeBase, run) -> GateReport:
     return report
 
 
-def diff_matches_claims(envelope: EnvelopeBase, run) -> GateReport:
-    """Every file claimed changed must exist on disk."""
+def changed_files_match(envelope: EnvelopeBase, run) -> GateReport:
+    """The claimed change set and the target repo's actual one must be equal.
+
+    This replaces `diff_matches_claims`, which asked only whether each claimed
+    path EXISTS — so claiming `README.md` passed in every repository that has
+    one, and a file the agent really did rewrite but never mentioned was
+    invisible. Both directions are checked now:
+
+      claimed but unchanged   the envelope is describing work that did not happen
+      changed but unclaimed   the envelope is hiding work that did
+
+    "Actual" is what permissions measured this phase change (see
+    `permissions.repo_changes`), not the whole dirty tree — so the engineer's
+    own uncommitted files are never charged to the agent.
+    """
     report = GateReport()
+    actual = set(permissions.repo_changes(run))
+    claimed: set[str] = set()
     for f in getattr(envelope, "changed_files", []):
-        p = Path(f)
-        report.check(f, p.exists(),
-                     f"exists, {_size(p)}" if p.exists() else "claimed changed file does not exist")
+        try:
+            claimed.add(run.targets.relative_to_worktree(f))
+        except ValueError as error:
+            report.check(f, False, f"claimed changed file is not in the target repo: {error}")
+
+    for f in sorted(claimed - actual):
+        report.check(f, False, "claimed as changed, but the target repo shows no such change")
+    for f in sorted(actual - claimed):
+        report.check(f, False, "changed in the target repo but missing from the envelope's claim")
+    for f in sorted(claimed & actual):
+        report.check(f, True, "claimed, and present in the target diff")
+    if not claimed and not actual:
+        report.check("changed_files", True, "nothing claimed, nothing changed")
     return report
 
 
@@ -98,7 +149,10 @@ def verdict_consistent(envelope: EnvelopeBase, run) -> GateReport:
 def tests_pass(command: str):
     """Gate factory: the given shell command must exit 0."""
     def gate(envelope: EnvelopeBase, run) -> GateReport:
-        result = subprocess.run(command, shell=True, capture_output=True, text=True)
+        # In the TARGET repo, not wherever the ADW process happens to be — the
+        # two are no longer the same directory by construction.
+        result = subprocess.run(command, shell=True, cwd=run.repo_root,
+                                capture_output=True, text=True)
         ok = result.returncode == 0
         note = f"exit {result.returncode}"
         if not ok:

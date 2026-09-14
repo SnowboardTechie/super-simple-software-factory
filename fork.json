@@ -1,0 +1,90 @@
+{
+  "$comment": "Machine-readable record of what this fork is and how it differs from upstream. Read by downstream consumers that pin an exact engine commit; keep it in step with README.md \u00a7 Fork divergence from upstream.",
+  "fork": {
+    "repository": "https://github.com/SnowboardTechie/super-simple-software-factory",
+    "clone_ssh": "git@github.com:SnowboardTechie/super-simple-software-factory.git",
+    "default_branch": "main"
+  },
+  "upstream": {
+    "repository": "https://github.com/disler/super-simple-software-factory",
+    "clone_ssh": "git@github.com:disler/super-simple-software-factory.git",
+    "default_branch": "main",
+    "reviewed_sha": "de31374882e7a4e3e5b7bb9bd09e69dc2f779356",
+    "reviewed_on": "2026-09-14"
+  },
+  "license": "MIT",
+  "attribution": "Super Simple Software Factory by IndyDevDan (disler). Forked under MIT; LICENSE and upstream attribution preserved unchanged.",
+  "update_policy": {
+    "detect": "weekly",
+    "apply": "reviewed-only",
+    "autoApply": false
+  },
+  "divergences": [
+    {
+      "id": "run-targets",
+      "surface": "adw_modules/data_types.py (RunTargets), adw_modules/runner.py",
+      "summary": "A run keeps control_root, state_root, target_repo and target_worktree apart instead of deriving one repo_root from the process cwd. A NAMED target_repo must be a checkout root and a NAMED target_worktree must be that repo or one of its linked worktrees (same git common directory); a DEFAULTED root still normalises to its checkout root, so launching from a subdirectory works as before. A state_root that contains a watched root is refused, because everything under the state root counts as runtime and would hide that root entirely. Additive: the defaults collapse to the single-root behaviour.",
+      "upstream_compatible": true
+    },
+    {
+      "id": "git-explicit-cwd",
+      "surface": "adw_modules/git_helper.py, adw_modules/changes.py, adw_modules/gates.py",
+      "summary": "Every git call takes an explicit cwd and defaults to the process directory, so a workflow can operate on a repository it was not launched from.",
+      "upstream_compatible": true
+    },
+    {
+      "id": "explicit-path-commit",
+      "surface": "adw_modules/git_helper.py (commit_paths), every ADW with a commit phase",
+      "summary": "commit_all() and its `git add -A` are removed with no compatibility shim. A commit phase passes the accepted change set from run.take_changes() to commit_paths(), which refuses paths the repository shows no change to and verifies the landed file set afterwards.",
+      "upstream_compatible": false
+    },
+    {
+      "id": "content-fingerprint",
+      "surface": "adw_modules/permissions.py (snapshot, repo_changes)",
+      "summary": "Working-tree fingerprints are '<type>:<git object id>' — content AND file type/mode, so a chmod +x on an already-dirty file is detected. Gitignored files and tracked paths hidden by pre-existing assume-unchanged/skip-worktree flags are watched. Every watched root is fingerprinted, not only the target worktree; does not walk into a wholly-ignored directory. Each Git root also snapshots HEAD attachment, all refs, and exact index bytes so clean self-commits and index-only mutations are detected, restored where safe, and failed. Runtime exemption uses the resolved state_root path, never a same-named relative directory in another repository.",
+      "upstream_compatible": true
+    },
+    {
+      "id": "permission-enforcement-on-failure",
+      "surface": "adw_modules/agents.py, adw_modules/permissions.py",
+      "summary": "Permission enforcement runs after every agent exit, including agent-process exceptions, malformed-envelope exhaustion, and gate failure. Unauthorized mutations are therefore rolled back before the originating error can leave the phase.",
+      "upstream_compatible": true
+    },
+    {
+      "id": "bidirectional-changed-file-gate",
+      "surface": "adw_modules/gates.py (changed_files_match replaces diff_matches_claims)",
+      "summary": "The changed-file gate compares the envelope's claim against the phase's actual target diff in both directions, so an omitted path fails as well as an invented one. The one-directional gate is removed.",
+      "upstream_compatible": false
+    },
+    {
+      "id": "artifact-root-confinement",
+      "surface": "adw_modules/gates.py, adw_modules/data_types.py (RunTargets.resolve_artifact)",
+      "summary": "Declared artifacts resolve under the run's state root or target worktree; traversal, absolute paths elsewhere and symlink escapes are refused, and an empty artifact list fails artifacts_exist instead of passing vacuously.",
+      "upstream_compatible": false
+    },
+    {
+      "id": "trace-redaction",
+      "surface": "adw_modules/redact.py, adw_modules/tracer.py",
+      "summary": "Every persisted untrusted string and structured payload is scrubbed and bounded at the one door into the trace: events.name and payload_json, envelopes.payload_json, gate_results.checks_json/violations_json, processes.command, phases.description/error, sessions.request, agent_sessions.model. Join keys (adw_id, phase_id, event_id, session_id, agent and gate names, pid) are left exact so the trace stays queryable.",
+      "upstream_compatible": true
+    },
+    {
+      "id": "test-suite",
+      "surface": "tests/",
+      "summary": "Adds a stdlib-unittest suite run with `uv run tests/run_tests.py`. No new runtime dependency; upstream had no tests.",
+      "upstream_compatible": true
+    },
+    {
+      "id": "protected-roots",
+      "surface": "adw_modules/data_types.py (RunTargets.protected_roots), adw_modules/permissions.py",
+      "summary": "control_root and target_repo are watched and denied outright whenever they are a different CANONICAL CHECKOUT from target_worktree, so separating the roots cannot un-protect the factory's own source or a review worktree's trunk, and a factory and trunk that are one checkout are watched once (first label wins). state_root stays the allowed runtime root. Snapshot keys are '<label>::<path>' outside the target worktree. BUILD_NOISE (__pycache__/*.pyc) is exempt in the target worktree only: in a protected root a .pyc is executable Python in a tree no agent may write to, so it breaches and is rolled back.",
+      "upstream_compatible": true
+    },
+    {
+      "id": "state-rooted-trace-db",
+      "surface": "adw_modules/data_types.py (RunTargets.trace_db, events_jsonl), adw_modules/session.py, adw_modules/runner.py",
+      "summary": "A relative observability.db resolves against state_root after stripping a leading data_dir prefix, so the shipped default resolves exactly where it always did while a separated state root keeps sssf.db and sessions/ together for the visualizer. An absolute db outside state_root is refused rather than silently escaping.",
+      "upstream_compatible": false
+    }
+  ]
+}
