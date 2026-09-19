@@ -22,10 +22,11 @@ A code phase does its work in the block body and logs what it did. The commit ph
     with run.phase(PhaseParams(name="commit", kind="code", owner="git",
                                description="Land the builder's changes, using the message it wrote")) as ph:
         message = build.commit_message or f"sssf({run.adw_id}): {build.summary}"
-        ph.log(sha=git_helper.commit_all(message), message=message)
+        ph.log(sha=git_helper.commit_paths(message, run.take_changes(),
+                                           cwd=run.repo_root), message=message)
 ```
 
-`commit_message` is a field on `PlanOutput`, `BuildOutput`, and `DocumentOutput` that the agent fills in **for its own work product**, so always pair it with a fallback — it defaults to empty. `commit_all` raises if the cwd is not a git repo or nothing changed, which fails the phase rather than committing nothing. A chain that commits more than once (`adw_simple_sdlc.py`) commits each product with its own author's message.
+`commit_message` is a field on `PlanOutput`, `BuildOutput`, and `DocumentOutput` that the agent fills in **for its own work product**, so always pair it with a fallback — it defaults to empty. `commit_paths` stages only `run.take_changes()`, the accepted change set, and raises — failing the phase — if the target is not a git repo, nothing was accepted, or a path it was handed is not actually dirty. A chain that commits more than once (`adw_simple_sdlc.py`) commits each product with its own author's message.
 
 ## Remove a phase
 
@@ -37,12 +38,12 @@ Gates are callables over the finished envelope — `gate(envelope, run) -> GateR
 
 ```python
         build = ph.call(AgentCall(output_type=BuildOutput, prompt=prompt, previous=plan,
-                                  gates=[gates.artifacts_exist, gates.diff_matches_claims]))
+                                  gates=[gates.artifacts_exist, gates.changed_files_match]))
 ```
 
 On violations the harness does **not** restart the agent — it sends the violation list back into the **same session** as a correction (pi's `--session-id` creates-or-continues, so the context window is intact), bounded by that phase's `retries`. Every gate result is traced to the `gate_results` table. Exhausting the retries raises `GateFailure` and fails the phase.
 
-Gate claims, not guesses: declared artifacts exist and are non-empty, declared JSON parses, declared changes appear in the diff, declared test commands pass. Never hardcode counts — express quantity as a property of the declared list ("at least one artifact", "ALL declared paths valid"). Plan quality and code taste are not gateable; that is a reviewer agent or a human. New reusable gates go in `adw_modules/gates.py` (`update_modules.md`).
+Gate claims, not guesses: declared artifacts exist, are inside the run's roots, and are non-empty; declared JSON parses; the declared change set equals the phase's real diff **in both directions**; declared test commands pass. Never hardcode counts — express quantity as a property of the declared list ("at least one artifact", "ALL declared paths valid"). Plan quality and code taste are not gateable; that is a reviewer agent or a human. New reusable gates go in `adw_modules/gates.py` (`update_modules.md`).
 
 ## Add a bounded fix loop
 
@@ -65,7 +66,7 @@ MAX_FIX_LOOPS = 3
                                    description="Repair what the suite reported, from its verbatim output")) as ph:
             previous = ph.call(AgentCall(output_type=BuildOutput, prompt=prompt,
                                          previous=quality.as_envelope(test, "tests"),
-                                         gates=[gates.diff_matches_claims]))
+                                         gates=[gates.changed_files_match]))
 
     return run.finish(accepted=test is not None and test.passed,
                       reason=f"the suite still failed after {MAX_FIX_LOOPS} fix attempt(s)")

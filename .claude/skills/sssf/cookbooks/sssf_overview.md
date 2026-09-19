@@ -25,6 +25,7 @@ adws/
 │   ├── runner.py                the Run object: run.phase(PhaseParams) → ph.call(AgentCall)
 │   ├── agent_pi.py              Pi interface (v1)   ·   agent_cc.py  Claude Code (v2, stubbed)
 │   ├── gates.py                 gate(envelope, run) -> GateReport — one check per item verified
+│   ├── redact.py                what the trace must not keep — applied at tracer.event()
 │   ├── changes.py               git diff vs a resolved base → ChangeSet → envelope for the documenter
 │   ├── prompts.py, session.py, tracer.py, console.py, git_helper.py, utils.py
 └── adw_data/

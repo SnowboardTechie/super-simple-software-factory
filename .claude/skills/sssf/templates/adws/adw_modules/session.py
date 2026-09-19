@@ -12,7 +12,7 @@ import signal
 import sys
 from pathlib import Path
 
-from .data_types import SSSFConfig
+from .data_types import RunTargets, SSSFConfig
 from .runner import Run
 from .tracer import Tracer
 from .utils import engineer_name, new_id
@@ -35,11 +35,17 @@ def _finalize_when_killed(run: Run) -> None:
         signal.signal(sig, handler)
 
 
-def ensure(cfg: SSSFConfig, adw_id: str | None = None) -> Run:
+def ensure(cfg: SSSFConfig, adw_id: str | None = None,
+           targets: RunTargets | None = None) -> Run:
     adw_id = adw_id or new_id(8)
-    tracer = Tracer(cfg.observability.db,
-                    f"{cfg.defaults.data_dir}/sessions/{adw_id}/events.jsonl")
-    run = Run(cfg=cfg, adw_id=adw_id, tracer=tracer, engineer=engineer_name())
+    targets = targets or RunTargets.resolve(cfg)
+    # Both sinks hang off the run's STATE root, and `trace_db` is what keeps the
+    # db beside the sessions it indexes — the visualizer derives `sessions/`
+    # from the db's own directory, so separating the two points the UI at
+    # nothing. Raises rather than silently escaping if the config disagrees.
+    tracer = Tracer(targets.trace_db(cfg), targets.events_jsonl(adw_id))
+    run = Run(cfg=cfg, adw_id=adw_id, tracer=tracer, engineer=engineer_name(),
+              targets=targets)
     tracer.session_start(adw_id, run.engineer, adw_name=Path(sys.argv[0]).stem)
     # This process is the run. Record it before any phase opens, so a run that
     # hangs in its first agent call is still killable by adw_id.

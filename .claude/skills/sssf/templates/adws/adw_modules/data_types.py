@@ -9,6 +9,7 @@ that its final JSON response is parsed against. No untyped handoffs.
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any, Callable, Literal, Optional, Type
 
 from pydantic import BaseModel, Field, ValidationInfo, field_validator
@@ -347,6 +348,267 @@ class SSSFConfig(BaseModel):
     defaults: ConfigDefaults = Field(default_factory=ConfigDefaults)
     observability: ObservabilityConfig = Field(default_factory=ObservabilityConfig)
     agents: list[AgentConfig] = Field(default_factory=list)
+
+
+# ── Run roots ────────────────────────────────────────────────────────────────
+
+def _checkout_root(path: Path) -> Path:
+    """The canonical worktree root `path` belongs to, or `path` itself outside git.
+
+    This is the identity two roots are compared BY. `<repo>` and `<repo>/src`
+    are one checkout; a linked worktree is its own, because git reports it as
+    its own toplevel.
+    """
+    from . import git_helper      # local: git_helper imports nothing back
+    return git_helper.repo_root(cwd=path) if git_helper.is_repo(cwd=path) else path
+
+
+class RunTargets(BaseModel):
+    """The four roots a run keeps apart, instead of the one it used to have.
+
+    v1 had a single `repo_root` — the git toplevel of wherever the process
+    started — and used it as the factory's home, the runtime's home, and the
+    codebase under work all at once. That is fine while a workflow edits the
+    repo it was launched from, and impossible the moment one does not: a review
+    workflow that reads a checkout elsewhere, a workflow driving a linked
+    worktree, a factory installed beside the repositories it serves rather than
+    inside one.
+
+        control_root     the factory: ADWs, modules, config. Never the agents'
+        state_root       sessions, handoffs, trace. Always writable
+        target_repo      the git repository the work is about
+        target_worktree  the checkout agents are actually spawned in — the same
+                         directory as target_repo, unless a linked worktree was
+                         named
+
+    Defaults collapse all four back to the single-root case, so every existing
+    ADW behaves exactly as before.
+    """
+
+    control_root: Path
+    state_root: Path
+    target_repo: Path
+    target_worktree: Path
+
+    @classmethod
+    def resolve(cls, cfg: "SSSFConfig", *, control_root: Path | str | None = None,
+                state_root: Path | str | None = None,
+                target_repo: Path | str | None = None,
+                target_worktree: Path | str | None = None) -> "RunTargets":
+        """Build the four roots, resolving symlinks so containment is decidable.
+
+        A root that is a symlink (macOS hands out `/var/...` temp dirs, and a
+        submodule-style checkout is often linked) would otherwise never contain
+        the `.resolve()`d artifact paths compared against it.
+
+        A named `target_worktree` is CHECKED against `target_repo`, not taken on
+        faith. Accepting any directory that happened to be a git repository
+        meant the identity the whole run is about could be decided by a typo —
+        a workflow pointed at an unrelated checkout would review it happily.
+        """
+        from . import git_helper      # local: git_helper imports nothing back
+
+        def need(value: Path | str | None, fallback: Path) -> Path:
+            path = Path(value).expanduser() if value is not None else fallback
+            if not path.exists():
+                raise ValueError(f"run target does not exist: {path}")
+            return path.resolve()
+
+        # A root that was DEFAULTED from the process directory normalises to the
+        # checkout it sits in — v1 read `git rev-parse --show-toplevel` from cwd,
+        # so launching an ADW from `src/` has always worked and still does. A
+        # root that was NAMED is checked instead of normalised: silently
+        # widening someone's explicit `--target src/` to the whole repository is
+        # how a run ends up about something other than what it was told.
+        control = need(control_root, Path.cwd())
+        if control_root is None:
+            control = _checkout_root(control)
+
+        repo = need(target_repo, control)
+        if target_repo is None:
+            repo = _checkout_root(repo)
+        elif _checkout_root(repo) != repo:
+            raise ValueError(
+                f"target repo {repo} is inside a git repository but is not its "
+                f"root — that is {_checkout_root(repo)}. Name the checkout root, "
+                f"not a path inside it. (A directory outside git is fine: only a "
+                f"commit phase needs a repository.)")
+
+        worktree = need(target_worktree, repo)
+
+        if target_worktree is not None and worktree != repo:
+            if not git_helper.is_repo(cwd=worktree):
+                raise ValueError(
+                    f"target worktree {worktree} is not a git repository")
+            canonical = git_helper.repo_root(cwd=worktree)
+            if canonical != worktree:
+                raise ValueError(
+                    f"target worktree {worktree} is not a worktree root — its "
+                    f"canonical root is {canonical}. Name the root, not a path inside it.")
+            if not git_helper.is_repo(cwd=repo):
+                raise ValueError(
+                    f"target repo {repo} is not a git repository, so {worktree} "
+                    f"cannot be one of its worktrees")
+            # A linked worktree shares its repository's git common directory.
+            # Nothing else does, which makes this the whole membership test.
+            if git_helper.common_dir(cwd=worktree) != git_helper.common_dir(cwd=repo):
+                raise ValueError(
+                    f"target worktree {worktree} belongs to an unrelated repository — "
+                    f"it must be {repo} itself or one of its linked worktrees")
+
+        # Relative by default (`adws/adw_data`), and it is the one root that may
+        # not exist yet — the first run is what creates it, so the topology is
+        # judged on the path rather than on what is currently on disk.
+        state = (Path(state_root).expanduser() if state_root is not None
+                 else control / cfg.defaults.data_dir).resolve()
+
+        # `permissions.snapshot()` drops every path under the state root, because
+        # the runtime is the one place agents must be able to write. A state root
+        # that CONTAINS a watched root therefore silences that whole root: every
+        # change in it reads as runtime and nothing is ever detected. Inside a
+        # watched root (the default) or disjoint from all of them (an external
+        # runtime) are both fine; around one is not.
+        for label, root in (("control root", control), ("target repo", repo),
+                            ("target worktree", worktree)):
+            if state == root or state in root.parents:
+                raise ValueError(
+                    f"state root {state} contains the {label} ({root}). Everything "
+                    f"under the state root is treated as this run's own runtime, so "
+                    f"that layout would hide every change in it. Put the runtime "
+                    f"inside a watched root, or somewhere disjoint from all of them.")
+
+        return cls(
+            control_root=control,
+            state_root=state,
+            target_repo=repo,
+            target_worktree=worktree,
+        )
+
+    # ── protected roots ─────────────────────────────────────────────────────
+
+    @property
+    def protected_roots(self) -> dict[str, Path]:
+        """Roots an agent may never modify, keyed by the label used in a snapshot.
+
+        `protected_files` guards the factory's source — but it is matched against
+        paths in the tree `permissions.snapshot()` looked at, and that was one
+        tree. So separating the roots quietly un-protected them: with a distinct
+        `control_root`, rewriting `adws/adw_modules/gates.py` produced no
+        detected path at all. The guard was still there, aimed at the wrong
+        directory.
+
+        Both extra roots are DENIED outright rather than run through an agent's
+        allowlist. `writes:` says what an agent may change in the codebase it was
+        given; it was never a licence to edit the factory judging it, or the
+        trunk a review worktree was cut from. `state_root` is deliberately absent
+        — it is the run's own runtime, and every agent must be able to write it.
+
+        Roots are compared by CANONICAL CHECKOUT, not by path string. With a
+        review worktree cut from the repository the factory lives in, `control`
+        and `trunk` are one and the same checkout — watching it under both
+        labels detected every change twice, reported it twice, and rolled it
+        back twice, the second attempt acting on a path the first had already
+        deleted. First label wins, so the choice is deterministic.
+        """
+        seen = {_checkout_root(self.target_worktree)}
+        roots: dict[str, Path] = {}
+        for label, path in (("control", self.control_root), ("trunk", self.target_repo)):
+            root = _checkout_root(path)
+            if root in seen:
+                continue
+            seen.add(root)
+            roots[label] = root
+        return roots
+
+    # ── runtime locations ───────────────────────────────────────────────────
+
+    def trace_db(self, cfg: "SSSFConfig") -> Path:
+        """Where the sqlite trace lives — always inside `state_root`.
+
+        The visualizer derives `sessions/` from the db's own directory, so a db
+        that is not beside the sessions sends the UI hunting in the wrong place.
+        Resolving a relative path against `control_root` did exactly that the
+        moment a state root was separated.
+
+        A relative path is resolved against `state_root`, after stripping a
+        leading `data_dir` prefix. That one rule covers both cases: in the
+        default layout `adws/adw_data/sssf.db` under a `state_root` of
+        `<control>/adws/adw_data` lands on `<control>/adws/adw_data/sssf.db` —
+        byte-identical to v1 — while a separated state root gets
+        `<state>/sssf.db`. An absolute path is accepted only if it is already
+        inside `state_root`, so an explicit override cannot silently escape the
+        runtime boundary it is supposed to describe.
+        """
+        declared = Path(cfg.observability.db).expanduser()
+        if declared.is_absolute():
+            resolved = declared.resolve()
+        else:
+            relative = declared
+            prefix = Path(cfg.defaults.data_dir)
+            if relative.is_relative_to(prefix):
+                relative = relative.relative_to(prefix)
+            resolved = (self.state_root / relative).resolve()
+
+        root = self.state_root.resolve()
+        if resolved != root and root not in resolved.parents:
+            raise ValueError(
+                f"observability.db resolves to {resolved}, outside this run's state "
+                f"root ({root}). The visualizer reads sessions/ from the db's own "
+                f"directory, so the two must not be separated.")
+        return resolved
+
+    def events_jsonl(self, adw_id: str) -> Path:
+        """The raw event log for one run — beside its session, under the state root."""
+        return self.state_root / "sessions" / adw_id / "events.jsonl"
+
+    @property
+    def artifact_roots(self) -> list[Path]:
+        """Where a declared artifact is allowed to be: its own runtime, or the
+        codebase it was working on. Nothing else is the phase's to point at."""
+        return [self.state_root, self.target_worktree]
+
+    def resolve_artifact(self, declared: str) -> Path:
+        """Turn a declared artifact path into a real one inside an allowed root.
+
+        Raises ValueError for a blank declaration, a traversal, an absolute path
+        elsewhere on the filesystem, and a symlink whose target escapes — the
+        last of which is why this resolves before it compares, rather than
+        checking the string it was handed.
+        """
+        text = (declared or "").strip()
+        if not text:
+            raise ValueError("artifact declaration is empty")
+        candidate = Path(text).expanduser()
+        if not candidate.is_absolute():
+            candidate = self.target_worktree / candidate
+        # strict=False: a declared-but-missing artifact must reach the gate that
+        # reports it missing, not die here as a traversal.
+        resolved = candidate.resolve()
+        for root in self.artifact_roots:
+            if resolved == root or root in resolved.parents:
+                return resolved
+        raise ValueError(
+            f"artifact {declared!r} resolves to {resolved}, outside this run's roots "
+            f"({', '.join(str(r) for r in self.artifact_roots)})")
+
+    def relative_to_worktree(self, declared: str) -> str:
+        """A repo path as git spells it, from whatever the agent wrote down.
+
+        Raises ValueError when the path is not inside the target worktree, so a
+        claim about `/etc/hosts` fails a changed-file gate instead of being
+        compared as a literal string that could never match.
+        """
+        text = (declared or "").strip()
+        if not text:
+            raise ValueError("path is empty")
+        candidate = Path(text).expanduser()
+        if not candidate.is_absolute():
+            candidate = self.target_worktree / candidate
+        resolved = candidate.resolve()
+        if resolved != self.target_worktree and self.target_worktree not in resolved.parents:
+            raise ValueError(f"{declared!r} is outside the target worktree "
+                             f"({self.target_worktree})")
+        return resolved.relative_to(self.target_worktree).as_posix()
 
 
 # ── Tracing ──────────────────────────────────────────────────────────────────

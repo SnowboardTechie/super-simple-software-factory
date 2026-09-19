@@ -25,9 +25,9 @@ GITIGNORE_ENTRIES = [
     "adws/adw_data/sssf.db*",
     ".env",
     # The ADWs are Python, so importing adw_modules writes bytecode next to it.
-    # Chains that end in a commit phase call `git add -A`, so without this a
-    # stamped repo commits its own .pyc files — 15 of them showed up in the
-    # first repo that was ever installed into from scratch.
+    # Commit phases stage an explicit path set now, so bytecode can no longer be
+    # swept into a commit — but it would still clutter every `git status` the
+    # operator runs, and permissions.BUILD_NOISE already treats it as noise.
     "__pycache__/",
     "*.pyc",
 ]

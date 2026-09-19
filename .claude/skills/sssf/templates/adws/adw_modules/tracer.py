@@ -3,6 +3,24 @@
 Files are the raw record; sssf.db is the queryable mirror the UI polls.
 No push transport — the flow is always: agents -> sqlite -> web ui.
 WAL mode so the UI can read while ADW processes write.
+
+EVERY untrusted string and structured payload passes through `redact` on the way
+in — `events.name` and `payload_json`, `envelopes.payload_json`,
+`gate_results.checks_json`/`violations_json`, `processes.command`,
+`phases.description`/`error`, `sessions.request`, and the model name on an agent
+session. All of them are free text that came from an agent, a tool call, or an
+exception message, and all of them are read back by the visualizer.
+
+Redaction happens HERE rather than at each call site: there is one door into the
+trace, and a rule enforced at the door cannot be forgotten by the next caller.
+
+What is deliberately NOT scrubbed: identifiers. `adw_id`, `phase_id`,
+`event_id`, `envelope_id`, the coding agent's `session_id`, an agent's name, a
+gate's name, and a pid are join keys — corrupting one to hide a secret would
+break every query the trace exists to answer, and none of them carry operator
+input. Files under the session runtime (`raw_output.jsonl`, `envelope.json`,
+prompts) are also raw by design: they are the evidence the trace REFERS to, and
+they live only in local ignored state.
 """
 
 from __future__ import annotations
@@ -11,6 +29,7 @@ import json
 import sqlite3
 from pathlib import Path
 
+from . import redact
 from .data_types import AgentConfig, EventRecord, GateReport, Phase
 from .utils import ensure_dir, new_id, now_iso
 
@@ -123,14 +142,17 @@ class Tracer:
     def event(self, record: EventRecord) -> str:
         event_id = f"evt_{new_id(12)}"
         ts = now_iso()
-        line = {"event_id": event_id, "ts": ts, **record.model_dump()}
+        payload = redact.scrub(record.payload)
+        name = redact.scrub(record.name)
+        line = {"event_id": event_id, "ts": ts, **record.model_dump(),
+                "name": name, "payload": payload}
         with self.events_jsonl.open("a") as f:
             f.write(json.dumps(line) + "\n")
         self.conn.execute(
             "INSERT INTO events (event_id, adw_id, phase_id, parent_id, type, name,"
             " payload_json, tokens, started_at, ended_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
             (event_id, record.adw_id, record.phase_id, record.parent_id, record.type,
-             record.name, json.dumps(record.payload), record.tokens,
+             name, json.dumps(payload), record.tokens,
              record.started_at or ts, record.ended_at),
         )
         return event_id
@@ -155,7 +177,7 @@ class Tracer:
 
     def session_request(self, adw_id: str, request: str) -> None:
         self.conn.execute("UPDATE sessions SET request=? WHERE adw_id=?",
-                          (request[:500], adw_id))
+                          (redact.scrub(request)[:500], adw_id))
 
     def session_finish(self, adw_id: str, ok: bool) -> None:
         self.conn.execute(
@@ -183,7 +205,7 @@ class Tracer:
         self.conn.execute(
             "INSERT INTO processes (adw_id, kind, name, pid, command, started_at)"
             " VALUES (?,?,?,?,?,?)",
-            (adw_id, kind, name, pid, command[:500], now_iso()),
+            (adw_id, kind, name, pid, redact.scrub(command)[:500], now_iso()),
         )
 
     def process_end(self, adw_id: str, pid: int) -> None:
@@ -223,8 +245,11 @@ class Tracer:
             " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)"
             " ON CONFLICT(phase_id) DO UPDATE SET status=excluded.status,"
             " attempt=excluded.attempt, error=excluded.error, ended_at=excluded.ended_at",
+            # name/kind/owner are identity; description and error are free text —
+            # an exception message routinely quotes the command that produced it.
             (phase.phase_id, phase.adw_id, phase.seq, p.name, p.kind, p.owner,
-             p.description, phase.status, phase.attempt, p.retries, phase.error,
+             redact.scrub(p.description), phase.status, phase.attempt, p.retries,
+             redact.scrub(phase.error) if phase.error else phase.error,
              phase.started_at, phase.ended_at),
         )
 
@@ -235,7 +260,7 @@ class Tracer:
             "INSERT INTO envelopes (envelope_id, adw_id, phase_id, agent, output_type,"
             " payload_json, valid, attempt, created_at) VALUES (?,?,?,?,?,?,?,?,?)",
             (f"env_{new_id(12)}", phase.adw_id, phase.phase_id, agent, output_type,
-             payload_json, int(valid), attempt, now_iso()),
+             redact.scrub_json(payload_json), int(valid), attempt, now_iso()),
         )
 
     def gate_row(self, phase: Phase, gate: str, report: GateReport, attempt: int) -> None:
@@ -243,9 +268,12 @@ class Tracer:
         self.conn.execute(
             "INSERT INTO gate_results (adw_id, phase_id, attempt, gate, passed,"
             " violations_json, checks_json, created_at) VALUES (?,?,?,?,?,?,?,?)",
+            # A gate check's `item` is often a command and its `note` the
+            # command's output — both quote whatever the agent ran.
             (phase.adw_id, phase.phase_id, attempt, gate, int(report.passed),
-             json.dumps(report.violations),
-             json.dumps([c.model_dump() for c in report.checks]), now_iso()),
+             json.dumps(redact.scrub(report.violations)),
+             json.dumps(redact.scrub([c.model_dump() for c in report.checks])),
+             now_iso()),
         )
 
     def agent_session_row(self, adw_id: str, agent: AgentConfig, session_id: str,
@@ -266,6 +294,6 @@ class Tracer:
             " context_tokens=excluded.context_tokens,"
             " context_window=excluded.context_window,"
             " last_used_at=excluded.last_used_at",
-            (adw_id, agent.name, agent.coding_agent, agent.model, agent.color,
-             session_id, context_tokens, context_window, ts, ts),
+            (adw_id, agent.name, agent.coding_agent, redact.scrub(agent.model),
+             agent.color, session_id, context_tokens, context_window, ts, ts),
         )

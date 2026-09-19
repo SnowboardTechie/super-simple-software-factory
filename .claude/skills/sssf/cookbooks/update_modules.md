@@ -15,14 +15,15 @@ Extend `adws/adw_modules/` with new low-level logic.
 | `runner.py` | the `Run` object; `run.phase(PhaseParams)` context manager; `ph.call(AgentCall)` |
 | `agent_pi.py` | the Pi interface (v1) — non-interactive `pi -p --mode json`, JSONL stream tailed live, model resolved against `~/.pi/agent/models.json`; `--session-id` creates-or-continues, so running and continuing an agent are the same call |
 | `agent_cc.py` | the Claude Code interface — stubbed in v1, lands in v2 |
-| `gates.py` | validation gates over envelope claims |
+| `gates.py` | validation gates over envelope claims. Declared paths resolve through `run.targets` first, so a gate can only be pointed at the run's own roots |
+| `redact.py` | what the trace must not keep: secret-named keys, credential-shaped values, and size bounds, applied in `tracer.event()` |
 | `changes.py` | deterministic change capture: resolve the base ref, `git diff` into `context_handoff/changes.diff`, adapt the `ChangeSet` into an envelope an agent can be handed |
 | `prompts.py` | load system/user prompt refs from config, render placeholders |
 | `session.py` | mint or join `adw_id`, maintain `agent_map.json`, create session dirs incl. `context_handoff/` |
 | `tracer.py` | append JSONL **and** insert every event into `sssf.db` as it happens |
 | `console.py` | the terminal narrative — every line printed also lands in the db as a `log` event, so the UI reads the same story; plain sequential lines, no spinners |
 | `console.py` | the rich stdout reporter — every line printed is ALSO traced as a `log` event (`{message, level}`) so the terminal and the swim-lane UI tell the same story |
-| `git_helper.py` | branch, status, diff, commit — the raw plumbing `changes.py` composes |
+| `git_helper.py` | branch, status, diff, explicit-path commit — the raw plumbing `changes.py` composes. Every call takes a `cwd`, so a run can be about a repository it was not launched from |
 | `utils.py` | safe subprocess env, logging, `resolve_prompt` |
 
 ## Never `print()`
